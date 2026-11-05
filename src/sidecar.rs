@@ -13,7 +13,7 @@
 //! ```
 
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = "zotero-mcp.json";
 /// The sidecar format this build understands. Zotero bumps `version` only for
@@ -36,6 +36,8 @@ pub struct Launch {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+	#[error("can't read {path}: {source}")]
+	Unreadable { path: PathBuf, source: std::io::Error },
 	#[error("{FILE_NAME} is invalid: {0}")]
 	Invalid(#[from] serde_json::Error),
 	#[error("{FILE_NAME} has format {0}, but this zotero-mcp-stdio only reads format {FORMAT_VERSION}")]
@@ -44,8 +46,12 @@ pub enum Error {
 
 /// The sidecar in `profile_dir`, or `None` if Zotero hasn't written one.
 pub fn read(profile_dir: &Path) -> Result<Option<Sidecar>, Error> {
-	let Ok(text) = std::fs::read_to_string(profile_dir.join(FILE_NAME)) else {
-		return Ok(None);
+	let path = profile_dir.join(FILE_NAME);
+	let text = match std::fs::read_to_string(&path) {
+		Ok(text) => text,
+		// Only a missing file means Zotero hasn't written one
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+		Err(source) => return Err(Error::Unreadable { path, source }),
 	};
 	// Check the version before the other fields, so a future format that
 	// changes them is reported as unsupported rather than as invalid

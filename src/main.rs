@@ -7,6 +7,8 @@
 //!   the command that starts Zotero come from the sidecar file Zotero writes
 //!   into its profile directory on every launch.
 //! - If Zotero isn't running, this server starts it and waits for it.
+//! - Every failure becomes a tool result the model can relay. The exception
+//!   is a panic: the release build aborts, and the AI app sees the server exit.
 
 mod profile;
 mod sidecar;
@@ -14,28 +16,28 @@ mod zotero;
 
 use clap::Parser;
 use rmcp::model::{
-	CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, ListToolsResult,
-	PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+	CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, InputRequiredResult,
+	JsonObject, ListToolsResult, PaginatedRequestParams, ProtocolVersion, RequestMetaObject, ServerCapabilities,
+	ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Value, json};
-use sidecar::Sidecar;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 const DOWNLOAD_URL: &str = "https://www.zotero.org/download/";
-/// How long to wait for a started Zotero to open its port.
-const LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Stdio MCP server that connects AI apps to a running Zotero
 #[derive(Parser)]
 #[command(version)]
 struct Options {
 	/// Identifies the AI app (claude-desktop, codex, ...) to Zotero, for per-app permissions
-	#[arg(long = "client", value_name = "ID")]
+	#[arg(long = "client", value_name = "ID", value_parser = zotero::parse_client_id)]
 	client_id: Option<String>,
 	/// Zotero profile directory [default: the default profile in profiles.ini]
 	#[arg(long = "profile", value_name = "DIR")]
@@ -43,8 +45,9 @@ struct Options {
 	/// Tool definitions [default: tools.json next to this executable]
 	#[arg(long = "tools", value_name = "FILE")]
 	tools_file: Option<PathBuf>,
-	/// How long to wait for one tool call before telling the model Zotero may
-	/// be waiting for the user's approval. Calls can wait on a consent dialog.
+	/// Longest time one tool call may take, including starting Zotero. Calls
+	/// can wait on a consent dialog in Zotero; past this, the model is told
+	/// the outcome is unknown.
 	#[arg(long, value_name = "SECONDS", default_value_t = 50.0)]
 	call_timeout: f64,
 }
@@ -57,6 +60,12 @@ enum StartupError {
 	ToolsUnreadable { path: PathBuf, source: std::io::Error },
 	#[error("invalid tool definitions in {path}: {source}")]
 	ToolsInvalid { path: PathBuf, source: serde_json::Error },
+	#[error("invalid tool {name:?} in {path}: {reason}")]
+	ToolInvalid {
+		path: PathBuf,
+		name: String,
+		reason: &'static str,
+	},
 	#[error("--call-timeout must be a positive number of seconds")]
 	BadTimeout,
 	#[error(transparent)]
@@ -78,96 +87,191 @@ fn load_tools(path: &Path) -> Result<Vec<Tool>, StartupError> {
 		path: path.to_owned(),
 		source,
 	})?;
+	// The MCP rules decoding doesn't check. Names are also sent as a header.
+	let mut names = HashSet::new();
+	for tool in &file.tools {
+		let invalid = |reason| StartupError::ToolInvalid {
+			path: path.to_owned(),
+			name: tool.name.to_string(),
+			reason,
+		};
+		let name_ok = (1..=128).contains(&tool.name.len())
+			&& tool
+				.name
+				.bytes()
+				.all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b));
+		if !name_ok {
+			return Err(invalid("names must be 1-128 letters, digits, '_', '-' or '.'"));
+		}
+		if !names.insert(&tool.name) {
+			return Err(invalid("defined more than once"));
+		}
+		if tool.input_schema.get("type") != Some(&Value::from("object")) {
+			return Err(invalid("inputSchema must have \"type\": \"object\""));
+		}
+	}
 	Ok(file.tools)
 }
 
 struct Server {
 	tools: Vec<Tool>,
+	/// From `--profile`. Otherwise the default profile is looked up on every
+	/// call, so a profile created after this server started is found.
 	profile_dir: Option<PathBuf>,
 	client: zotero::Client,
+	call_timeout: Duration,
 	/// Held while starting Zotero, so concurrent calls start it once.
 	launching: Mutex<()>,
 }
 
 impl Server {
-	fn sidecar(&self) -> Result<Option<Sidecar>, sidecar::Error> {
-		match &self.profile_dir {
-			Some(dir) => sidecar::read(dir),
+	/// The sidecar Zotero wrote, `Ok(None)` if there's none, or a message for
+	/// the model if it exists but can't be used.
+	fn read_sidecar(&self) -> Result<Option<sidecar::Sidecar>, String> {
+		let unusable = |e: &dyn std::fmt::Display| {
+			tracing::warn!("{e}");
+			format!(
+				"Zotero's connection settings can't be used ({e}). Ask the user to restart Zotero, which \
+				rewrites them."
+			)
+		};
+		let profile_dir = match &self.profile_dir {
+			Some(dir) => Some(dir.clone()),
+			None => match profile::profile_root() {
+				Some(root) => profile::default_profile(&root).map_err(|e| unusable(&e))?,
+				None => None,
+			},
+		};
+		match profile_dir {
+			Some(dir) => sidecar::read(&dir).map_err(|e| unusable(&e)),
 			None => Ok(None),
 		}
 	}
 
-	async fn forward(&self, request: &CallToolRequestParams) -> Result<CallToolResult, String> {
-		let sidecar = self.sidecar().map_err(|e| {
-			tracing::warn!("{e}");
-			format!(
-				"Zotero's connection settings can't be read ({e}). Ask the user to restart Zotero, which updates them."
-			)
-		})?;
-		let Some(sidecar) = sidecar else {
-			return Err(format!(
-				"Zotero isn't set up for AI apps on this computer. If Zotero is installed, ask the user to open it \
-				once. Otherwise, the user can download it from {DOWNLOAD_URL}"
-			));
+	async fn forward(
+		&self,
+		request: &CallToolRequestParams,
+		meta: &RequestMetaObject,
+		modern: bool,
+		deadline: Instant,
+	) -> Result<CallToolResponse, String> {
+		let sidecar = self.read_sidecar()?.ok_or_else(not_set_up)?;
+		let params = upstream_params(request, meta, modern);
+		let send = |port, params| {
+			self.client
+				.request(port, "tools/call", Some(&request.name), params, deadline)
 		};
-		let params = json!({
-			"name": request.name,
-			"arguments": request.arguments.clone().map(Value::Object).unwrap_or_else(|| json!({})),
-			"_meta": {
-				"io.modelcontextprotocol/protocolVersion": zotero::PROTOCOL_VERSION,
-				"io.modelcontextprotocol/clientInfo": {
-					"name": "zotero-mcp-stdio",
-					"version": env!("CARGO_PKG_VERSION"),
-				},
-				"io.modelcontextprotocol/clientCapabilities": {},
-			},
-		});
-		let mut result = self
-			.client
-			.request(sidecar.port, "tools/call", Some(&request.name), params.clone())
-			.await;
+		let mut result = send(sidecar.port, params.clone()).await;
 		if matches!(result, Err(zotero::Error::NotRunning)) {
-			self.start_zotero(&sidecar).await?;
-			result = self
-				.client
-				.request(sidecar.port, "tools/call", Some(&request.name), params)
-				.await;
+			let port = self.start_zotero(deadline).await?;
+			result = send(port, params).await;
 		}
 		match result {
-			Ok(value) => serde_json::from_value(value).map_err(|e| format!("Unexpected tool result from Zotero: {e}")),
+			Ok(value) => decode_result(value, modern),
 			Err(zotero::Error::NotRunning) => Err("Zotero isn't running. Ask the user to open Zotero.".into()),
 			Err(zotero::Error::NoEndpoint) => Err(
 				"This version of Zotero doesn't support AI apps, or AI app access is turned off in Zotero's \
 				settings. Ask the user to update Zotero or turn the setting on."
 					.into(),
 			),
-			Err(zotero::Error::Timeout) => Err(
-				"Zotero didn't answer in time. It may be waiting for the user to approve this request in a \
-				Zotero window. Ask the user to respond there, then call the tool again."
-					.into(),
-			),
+			// The request reached Zotero, which may still carry it out. Zotero
+			// can't undo an operation it has started, so the model must not
+			// assume a retry is safe.
+			Err(zotero::Error::Timeout) => Err(format!(
+				"Zotero didn't respond within {} seconds. The request may be waiting for the user's approval \
+				in a Zotero window, or may still be running, and it can still complete after this message. \
+				Don't repeat this operation until you've asked the user whether it went through, or \
+				inspected the state with a read tool.",
+				self.call_timeout.as_secs_f64()
+			)),
 			Err(zotero::Error::Other(text)) => Err(text),
 		}
 	}
 
-	async fn start_zotero(&self, sidecar: &Sidecar) -> Result<(), String> {
-		let _guard = self.launching.lock().await;
-		if zotero::Client::is_listening(sidecar.port).await {
-			return Ok(());
+	/// Start Zotero if it isn't running and wait until it listens, returning
+	/// its port.
+	async fn start_zotero(&self, deadline: Instant) -> Result<u16, String> {
+		let not_ready = || {
+			format!(
+				"Zotero is starting but wasn't ready within {} seconds. Nothing was sent to it, so it's safe \
+				to call the tool again.",
+				self.call_timeout.as_secs_f64()
+			)
+		};
+		let _guard = tokio::time::timeout_at(deadline, self.launching.lock())
+			.await
+			.map_err(|_| not_ready())?;
+		// Another call may have started Zotero while this one waited
+		let sidecar = self.read_sidecar()?.ok_or_else(not_set_up)?;
+		if zotero::Client::is_listening(sidecar.port, deadline).await {
+			return Ok(sidecar.port);
 		}
 		let Some(launch) = &sidecar.launch else {
 			return Err("Zotero isn't running. Ask the user to open Zotero.".into());
 		};
 		spawn_detached(&launch.command, &launch.args)
 			.map_err(|e| format!("Zotero isn't running, and starting it failed ({e}). Ask the user to open Zotero."))?;
-		let deadline = tokio::time::Instant::now() + LAUNCH_TIMEOUT;
-		while tokio::time::Instant::now() < deadline {
-			if zotero::Client::is_listening(sidecar.port).await {
-				return Ok(());
+		let mut port = sidecar.port;
+		while Instant::now() < deadline {
+			// Zotero rewrites the sidecar as it starts, possibly with a new port
+			if let Ok(Some(sidecar)) = self.read_sidecar() {
+				port = sidecar.port;
 			}
-			tokio::time::sleep(Duration::from_millis(250)).await;
+			if zotero::Client::is_listening(port, deadline).await {
+				return Ok(port);
+			}
+			tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(250))).await;
 		}
-		Err("Zotero was started but didn't become ready. Ask the user to check that Zotero is open.".into())
+		Err(not_ready())
+	}
+}
+
+fn not_set_up() -> String {
+	format!(
+		"Zotero isn't set up for AI apps on this computer. If Zotero is installed, ask the user to open it \
+		once. Otherwise, the user can download it from {DOWNLOAD_URL}"
+	)
+}
+
+/// The `tools/call` params for Zotero: the client's request as received, with
+/// the per-request `_meta` that 2026-07-28 requires.
+fn upstream_params(request: &CallToolRequestParams, meta: &RequestMetaObject, modern: bool) -> Value {
+	let mut params = serde_json::to_value(request).expect("request params serialize");
+	// rmcp moves the request's _meta into the request context
+	let mut meta: JsonObject = meta.0.0.clone();
+	if !modern {
+		// A legacy client can't take part in multi-round requests, so describe
+		// this server, with no capabilities, rather than the client
+		meta.remove("io.modelcontextprotocol/clientInfo");
+		meta.remove("io.modelcontextprotocol/clientCapabilities");
+	}
+	meta.insert(
+		"io.modelcontextprotocol/protocolVersion".into(),
+		zotero::PROTOCOL_VERSION.into(),
+	);
+	meta.entry("io.modelcontextprotocol/clientInfo")
+		.or_insert_with(|| json!({ "name": "zotero-mcp-stdio", "version": env!("CARGO_PKG_VERSION") }));
+	meta.entry("io.modelcontextprotocol/clientCapabilities")
+		.or_insert_with(|| json!({}));
+	params["_meta"] = Value::Object(meta);
+	params
+}
+
+fn decode_result(value: Value, modern: bool) -> Result<CallToolResponse, String> {
+	let invalid = |e: serde_json::Error| format!("Unexpected tool result from Zotero: {e}");
+	match value.get("resultType").and_then(Value::as_str) {
+		// Zotero needs the client to supply input, e.g. an elicitation, and to
+		// call again with the answers
+		Some("input_required") if modern => serde_json::from_value::<InputRequiredResult>(value)
+			.map(Into::into)
+			.map_err(invalid),
+		Some("input_required") => {
+			Err("Zotero needs more input for this request, which this AI app doesn't support.".into())
+		}
+		Some("task") => Err("Zotero answered with a background task, which isn't supported yet.".into()),
+		_ => serde_json::from_value::<CallToolResult>(value)
+			.map(Into::into)
+			.map_err(invalid),
 	}
 }
 
@@ -177,6 +281,13 @@ fn spawn_detached(command: &str, args: &[String]) -> std::io::Result<()> {
 		.stdin(std::process::Stdio::null())
 		.stdout(std::process::Stdio::null())
 		.stderr(std::process::Stdio::null());
+	#[cfg(unix)]
+	{
+		// Its own process group, so an AI app that stops its servers by
+		// signalling their group doesn't take Zotero down too
+		use std::os::unix::process::CommandExt;
+		cmd.process_group(0);
+	}
 	#[cfg(windows)]
 	{
 		use std::os::windows::process::CommandExt;
@@ -208,13 +319,26 @@ impl ServerHandler for Server {
 	async fn call_tool(
 		&self,
 		request: CallToolRequestParams,
-		_context: RequestContext<RoleServer>,
+		context: RequestContext<RoleServer>,
 	) -> Result<CallToolResponse, McpError> {
-		let result = match self.forward(&request).await {
-			Ok(result) => result,
-			Err(text) => CallToolResult::error(vec![ContentBlock::text(text)]),
+		if !self.tools.iter().any(|tool| tool.name == request.name) {
+			return Err(McpError::invalid_params(
+				format!("Unknown tool: {}", request.name),
+				None,
+			));
+		}
+		let modern = context
+			.protocol_version()
+			.is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
+		let deadline = Instant::now() + self.call_timeout;
+		let result = tokio::select! {
+			result = self.forward(&request, &context.meta, modern, deadline) => result,
+			// rmcp drops the response to a cancelled call but keeps running
+			// this handler. Stop it, so a cancelled call doesn't start Zotero
+			// or send the request later. One already sent can't be recalled.
+			() = context.ct.cancelled() => return Err(McpError::internal_error("Cancelled", None)),
 		};
-		Ok(result.into())
+		Ok(result.unwrap_or_else(|text| CallToolResult::error(vec![ContentBlock::text(text)]).into()))
 	}
 }
 
@@ -250,17 +374,11 @@ async fn run(options: Options) -> Result<(), StartupError> {
 	// Fail at startup rather than serve an empty list: the AI app then shows
 	// the server as failed, with this message in its log
 	let tools = load_tools(&tools_file)?;
-	let profile_dir = options
-		.profile_dir
-		.or_else(|| profile::default_profile(&profile::profile_root()?));
-	if profile_dir.is_none() {
-		tracing::info!("no Zotero profile found; tool calls will say Zotero isn't set up");
-	}
-
 	let server = Arc::new(Server {
 		tools,
-		profile_dir,
-		client: zotero::Client::new(options.client_id, call_timeout),
+		profile_dir: options.profile_dir,
+		client: zotero::Client::new(options.client_id),
+		call_timeout,
 		launching: Mutex::new(()),
 	});
 	let service = server

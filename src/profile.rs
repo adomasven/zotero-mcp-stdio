@@ -48,10 +48,14 @@ fn linux_profile_root(home: &Path, xdg_config_home: Option<PathBuf>, force_legac
 }
 
 /// The default profile directory under `root`, or `None` if `profiles.ini`
-/// is missing or names no profile.
-pub fn default_profile(root: &Path) -> Option<PathBuf> {
-	let ini = std::fs::read_to_string(root.join("profiles.ini")).ok()?;
-	default_profile_from_ini(root, &ini)
+/// is missing or names no existing profile. Other read failures are errors,
+/// so they aren't mistaken for Zotero never having run.
+pub fn default_profile(root: &Path) -> std::io::Result<Option<PathBuf>> {
+	match std::fs::read_to_string(root.join("profiles.ini")) {
+		Ok(ini) => Ok(default_profile_from_ini(root, &ini)),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+		Err(e) => Err(e),
+	}
 }
 
 fn default_profile_from_ini(root: &Path, ini: &str) -> Option<PathBuf> {

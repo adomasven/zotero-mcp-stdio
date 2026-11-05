@@ -1,7 +1,8 @@
 //! Forwarding MCP requests to Zotero's `/mcp` endpoint on 127.0.0.1.
 
 use serde_json::Value;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::time::Instant;
 
 pub const MCP_PATH: &str = "/mcp";
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
@@ -12,6 +13,8 @@ pub enum Error {
 	NotRunning,
 	#[error("Zotero has no MCP endpoint (older Zotero, or MCP is turned off)")]
 	NoEndpoint,
+	/// The request was sent, but no answer came before the deadline. Zotero
+	/// may still carry it out.
 	#[error("Zotero didn't answer in time")]
 	Timeout,
 	#[error("{0}")]
@@ -21,46 +24,70 @@ pub enum Error {
 pub struct Client {
 	http: reqwest::Client,
 	client_id: Option<String>,
+	next_id: AtomicU64,
 }
 
 impl Client {
-	pub fn new(client_id: Option<String>, timeout: Duration) -> Self {
+	pub fn new(client_id: Option<String>) -> Self {
 		let http = reqwest::Client::builder()
-			.timeout(timeout)
 			// Never route 127.0.0.1 through an HTTP_PROXY from the environment
 			.no_proxy()
+			// Zotero never redirects. Following one would send the request,
+			// library data included, to wherever the redirect points.
+			.redirect(reqwest::redirect::Policy::none())
 			.user_agent(concat!("zotero-mcp-stdio/", env!("CARGO_PKG_VERSION")))
 			.build()
 			.expect("HTTP client configuration is valid");
-		Client { http, client_id }
+		Client {
+			http,
+			client_id,
+			next_id: AtomicU64::new(1),
+		}
 	}
 
-	pub async fn is_listening(port: u16) -> bool {
-		tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok()
+	/// Whether something accepts connections on `port`, giving up at `deadline`.
+	pub async fn is_listening(port: u16, deadline: Instant) -> bool {
+		let connect = tokio::net::TcpStream::connect(("127.0.0.1", port));
+		matches!(tokio::time::timeout_at(deadline, connect).await, Ok(Ok(_)))
 	}
 
-	/// Send one JSON-RPC request and return its `result` object.
-	pub async fn request(&self, port: u16, method: &str, name: Option<&str>, params: Value) -> Result<Value, Error> {
+	/// Send one JSON-RPC request and return its `result` object, giving up at
+	/// `deadline`. `name` must be a valid header value; callers pass tool
+	/// names, which are checked when tools.json is loaded.
+	pub async fn request(
+		&self,
+		port: u16,
+		method: &str,
+		name: Option<&str>,
+		params: Value,
+		deadline: Instant,
+	) -> Result<Value, Error> {
+		let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 		let body = serde_json::json!({
 			"jsonrpc": "2.0",
-			"id": 1,
+			"id": id,
 			"method": method,
 			"params": params,
 		});
+		let remaining = deadline.saturating_duration_since(Instant::now());
+		if remaining.is_zero() {
+			return Err(Error::Timeout);
+		}
 		// reqwest sets Host to 127.0.0.1:<port> and sends no Origin, which
 		// Zotero's server requires
 		let mut request = self
 			.http
 			.post(format!("http://127.0.0.1:{port}{MCP_PATH}"))
+			.timeout(remaining)
 			.header("Accept", "application/json, text/event-stream")
 			.header("MCP-Protocol-Version", PROTOCOL_VERSION)
 			.header("Mcp-Method", method)
 			.json(&body);
 		if let Some(name) = name {
-			request = request.header("Mcp-Name", header_safe(name));
+			request = request.header("Mcp-Name", name);
 		}
-		if let Some(id) = &self.client_id {
-			request = request.header("Zotero-MCP-Client", header_safe(id));
+		if let Some(client_id) = &self.client_id {
+			request = request.header("Zotero-MCP-Client", client_id);
 		}
 
 		let response = request.send().await.map_err(classify)?;
@@ -69,7 +96,20 @@ impl Client {
 			return Err(Error::NoEndpoint);
 		}
 		let bytes = response.bytes().await.map_err(classify)?;
-		parse_body(status.as_u16(), &bytes)
+		parse_body(status, id, &bytes)
+	}
+}
+
+/// A valid `--client` value: what Zotero shows and keys permissions on, so
+/// it's checked once instead of being altered to fit in a header.
+pub fn parse_client_id(value: &str) -> Result<String, String> {
+	let valid = !value.is_empty()
+		&& value.len() <= 64
+		&& value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+	if valid {
+		Ok(value.to_owned())
+	} else {
+		Err("use 1-64 letters, digits, '.', '_' or '-'".into())
 	}
 }
 
@@ -83,47 +123,74 @@ fn classify(e: reqwest::Error) -> Error {
 	}
 }
 
-fn header_safe(value: &str) -> String {
-	value.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect()
-}
-
-fn parse_body(status: u16, body: &[u8]) -> Result<Value, Error> {
-	let message: Value = serde_json::from_slice(body).map_err(|_| {
+/// Check the JSON-RPC response envelope and return `result`.
+fn parse_body(status: reqwest::StatusCode, id: u64, body: &[u8]) -> Result<Value, Error> {
+	let unexpected = || {
 		Error::Other(format!(
-			"Zotero returned HTTP {status}: {}",
+			"Zotero returned an unexpected response (HTTP {status}): {}",
 			String::from_utf8_lossy(body).trim()
 		))
-	})?;
-	if let Some(result) = message.get("result") {
-		return Ok(result.clone());
+	};
+	let Ok(Value::Object(mut message)) = serde_json::from_slice::<Value>(body) else {
+		return Err(unexpected());
+	};
+	if message.get("jsonrpc") != Some(&Value::from("2.0")) || message.get("id") != Some(&Value::from(id)) {
+		return Err(unexpected());
 	}
-	if let Some(error) = message.get("error") {
-		let text = error.get("message").and_then(Value::as_str).unwrap_or("Unknown error");
-		return Err(Error::Other(format!("Zotero: {text}")));
+	match (message.remove("result"), message.remove("error")) {
+		(Some(result), None) if status.is_success() => Ok(result),
+		(None, Some(error)) => {
+			let text = error.get("message").and_then(Value::as_str).unwrap_or("Unknown error");
+			Err(Error::Other(format!("Zotero: {text}")))
+		}
+		_ => Err(unexpected()),
 	}
-	Err(Error::Other(format!(
-		"Zotero returned HTTP {status} without a JSON-RPC result"
-	)))
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use reqwest::StatusCode;
+
+	fn parse(status: u16, body: &str) -> Result<Value, Error> {
+		parse_body(StatusCode::from_u16(status).unwrap(), 7, body.as_bytes())
+	}
 
 	#[test]
-	fn parses_result_and_errors() {
-		let ok = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#;
-		assert_eq!(parse_body(200, ok).unwrap(), serde_json::json!({ "content": [] }));
+	fn accepts_a_result_or_error_for_the_request_sent() {
+		let ok = parse(200, r#"{"jsonrpc":"2.0","id":7,"result":{"content":[]}}"#);
+		assert_eq!(ok.unwrap(), serde_json::json!({ "content": [] }));
 
-		let rpc_error = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Unknown tool"}}"#;
-		match parse_body(400, rpc_error) {
-			Err(Error::Other(text)) => assert_eq!(text, "Zotero: Unknown tool"),
-			other => panic!("unexpected {other:?}"),
+		let rpc_error = parse(
+			400,
+			r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"Unknown tool"}}"#,
+		);
+		assert!(matches!(rpc_error, Err(Error::Other(text)) if text == "Zotero: Unknown tool"));
+	}
+
+	#[test]
+	fn rejects_responses_that_are_not_for_this_request() {
+		for (status, body) in [
+			(200, r#"{"jsonrpc":"2.0","id":8,"result":{}}"#),
+			(200, r#"{"id":7,"result":{}}"#),
+			(200, r#"{"jsonrpc":"2.0","id":7,"result":{},"error":{"message":"x"}}"#),
+			(200, r#"{"jsonrpc":"2.0","id":7}"#),
+			(500, r#"{"jsonrpc":"2.0","id":7,"result":{}}"#),
+			(500, "Internal error"),
+			(307, ""),
+		] {
+			assert!(
+				matches!(parse(status, body), Err(Error::Other(_))),
+				"{status} {body} was accepted"
+			);
 		}
+	}
 
-		match parse_body(500, b"Internal error\n") {
-			Err(Error::Other(text)) => assert_eq!(text, "Zotero returned HTTP 500: Internal error"),
-			other => panic!("unexpected {other:?}"),
+	#[test]
+	fn client_ids_are_checked_not_rewritten() {
+		assert_eq!(parse_client_id("claude-desktop").unwrap(), "claude-desktop");
+		for bad in ["", "codex\r\nX-Evil: 1", "kódex", "has space", &"a".repeat(65)] {
+			assert!(parse_client_id(bad).is_err(), "{bad:?} was accepted");
 		}
 	}
 }
