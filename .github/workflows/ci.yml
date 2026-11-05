@@ -1,0 +1,135 @@
+name: CI
+on: [ push, pull_request ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Lint, Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup installs the toolchain and components from rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  build:
+    name: Build ${{ matrix.dir }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Directory names match the architectures app/build.sh packages
+          - { dir: linux-x64,   os: ubuntu-24.04,     targets: x86_64-unknown-linux-musl }
+          - { dir: linux-arm64, os: ubuntu-24.04-arm, targets: aarch64-unknown-linux-musl }
+          - { dir: mac,         os: macos-latest,     targets: aarch64-apple-darwin x86_64-apple-darwin }
+          - { dir: win-x64,     os: windows-latest,   targets: x86_64-pc-windows-msvc }
+          - { dir: win-arm64,   os: windows-latest,   targets: aarch64-pc-windows-msvc }
+          - { dir: win32,       os: windows-latest,   targets: i686-pc-windows-msvc }
+    env:
+      # Static CRT on Windows, so the binary doesn't need the VC++ runtime
+      RUSTFLAGS: ${{ startsWith(matrix.os, 'windows') && '-C target-feature=+crt-static' || '' }}
+      # Oldest macOS Rust supports for x86_64; aarch64 starts at 11.0 regardless
+      MACOSX_DEPLOYMENT_TARGET: '10.12'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust targets
+        shell: bash
+        run: rustup target add ${{ matrix.targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.dir }}
+
+      - name: Build
+        shell: bash
+        run: |
+          for target in ${{ matrix.targets }}; do
+            cargo build --locked --release --target $target
+          done
+
+      - name: Collect binary
+        shell: bash
+        run: |
+          mkdir -p out/${{ matrix.dir }}
+          targets=(${{ matrix.targets }})
+          if [[ ${{ matrix.dir }} == mac ]]; then
+            lipo -create -output out/mac/zotero-mcp-stdio \
+              $(for t in "${targets[@]}"; do echo target/$t/release/zotero-mcp-stdio; done)
+            lipo -info out/mac/zotero-mcp-stdio
+          elif [[ ${{ matrix.dir }} == win* ]]; then
+            cp target/${targets[0]}/release/zotero-mcp-stdio.exe out/${{ matrix.dir }}/
+          else
+            cp target/${targets[0]}/release/zotero-mcp-stdio out/${{ matrix.dir }}/
+            file out/${{ matrix.dir }}/zotero-mcp-stdio
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.dir }}
+          path: out/${{ matrix.dir }}
+
+  package:
+    name: Package, Upload
+    needs: [ check, build ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: build
+
+      - name: Restore executable bits
+        run: chmod +x build/linux-*/zotero-mcp-stdio build/mac/zotero-mcp-stdio
+
+      - name: Create ZIP
+        run: |
+          mkdir build-zip
+          cd build
+          zip -r ../build-zip/$GITHUB_SHA.zip .
+          unzip -l ../build-zip/$GITHUB_SHA.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zotero-mcp-stdio-${{ github.sha }}
+          path: build-zip/${{ github.sha }}.zip
+
+      - uses: ruby/setup-ruby@v1
+        if: |
+          env.ACT != 'true'
+          && github.repository == 'zotero/zotero-mcp-stdio'
+          && github.event_name == 'push'
+          && (github.ref == 'refs/heads/main' || endsWith(github.ref, '-hotfix') || github.ref == 'refs/heads/gh-actions-ci-test')
+        with:
+          ruby-version: '3.3'
+
+      - name: Upload pre-build ZIP
+        if: |
+          env.ACT != 'true'
+          && github.repository == 'zotero/zotero-mcp-stdio'
+          && github.event_name == 'push'
+          && (github.ref == 'refs/heads/main' || endsWith(github.ref, '-hotfix') || github.ref == 'refs/heads/gh-actions-ci-test')
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          gem install --no-document dpl -v '>= 2.0'
+          dpl s3 --bucket zotero-download --local_dir build-zip --upload_dir ci/zotero-mcp-stdio --acl public_read

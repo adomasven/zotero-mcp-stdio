@@ -1,0 +1,4 @@
+[toolchain]
+# Same version as Zotero's app/config.sh (RUST_VERSION)
+channel = "1.94.0"
+components = ["clippy", "rustfmt"]
