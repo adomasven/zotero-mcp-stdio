@@ -36,9 +36,6 @@ const DOWNLOAD_URL: &str = "https://www.zotero.org/download/";
 #[derive(Parser)]
 #[command(version)]
 struct Options {
-	/// Identifies the AI app (claude-desktop, codex, ...) to Zotero, for per-app permissions
-	#[arg(long = "client", value_name = "ID", value_parser = zotero::parse_client_id)]
-	client_id: Option<String>,
 	/// Zotero profile directory [default: the default profile in profiles.ini]
 	#[arg(long = "profile", value_name = "DIR")]
 	profile_dir: Option<PathBuf>,
@@ -152,11 +149,12 @@ impl Server {
 		&self,
 		request: &CallToolRequestParams,
 		meta: &RequestMetaObject,
+		client_info: Option<Implementation>,
 		modern: bool,
 		deadline: Instant,
 	) -> Result<CallToolResponse, String> {
 		let sidecar = self.read_sidecar()?.ok_or_else(not_set_up)?;
-		let params = upstream_params(request, meta, modern);
+		let params = upstream_params(request, meta, client_info, modern);
 		let send = |port, params| {
 			self.client
 				.request(port, "tools/call", Some(&request.name), params, deadline)
@@ -235,22 +233,34 @@ fn not_set_up() -> String {
 
 /// The `tools/call` params for Zotero: the client's request as received, with
 /// the per-request `_meta` that 2026-07-28 requires.
-fn upstream_params(request: &CallToolRequestParams, meta: &RequestMetaObject, modern: bool) -> Value {
+///
+/// `client_info` is how the AI app names itself: from this request's `_meta`,
+/// or from `initialize` for a legacy client. Zotero keys per-app permissions on
+/// its name.
+fn upstream_params(
+	request: &CallToolRequestParams,
+	meta: &RequestMetaObject,
+	client_info: Option<Implementation>,
+	modern: bool,
+) -> Value {
 	let mut params = serde_json::to_value(request).expect("request params serialize");
 	// rmcp moves the request's _meta into the request context
 	let mut meta: JsonObject = meta.0.0.clone();
-	if !modern {
-		// A legacy client can't take part in multi-round requests, so describe
-		// this server, with no capabilities, rather than the client
-		meta.remove("io.modelcontextprotocol/clientInfo");
-		meta.remove("io.modelcontextprotocol/clientCapabilities");
-	}
 	meta.insert(
 		"io.modelcontextprotocol/protocolVersion".into(),
 		zotero::PROTOCOL_VERSION.into(),
 	);
-	meta.entry("io.modelcontextprotocol/clientInfo")
-		.or_insert_with(|| json!({ "name": "zotero-mcp-stdio", "version": env!("CARGO_PKG_VERSION") }));
+	if let Some(client_info) = client_info {
+		meta.insert(
+			"io.modelcontextprotocol/clientInfo".into(),
+			serde_json::to_value(client_info).expect("client info serializes"),
+		);
+	}
+	if !modern {
+		// A legacy client can't take part in multi-round requests, so it's
+		// described to Zotero as having no capabilities
+		meta.insert("io.modelcontextprotocol/clientCapabilities".into(), json!({}));
+	}
 	meta.entry("io.modelcontextprotocol/clientCapabilities")
 		.or_insert_with(|| json!({}));
 	params["_meta"] = Value::Object(meta);
@@ -332,7 +342,7 @@ impl ServerHandler for Server {
 			.is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
 		let deadline = Instant::now() + self.call_timeout;
 		let result = tokio::select! {
-			result = self.forward(&request, &context.meta, modern, deadline) => result,
+			result = self.forward(&request, &context.meta, context.client_info(), modern, deadline) => result,
 			// rmcp drops the response to a cancelled call but keeps running
 			// this handler. Stop it, so a cancelled call doesn't start Zotero
 			// or send the request later. One already sent can't be recalled.
@@ -377,7 +387,7 @@ async fn run(options: Options) -> Result<(), StartupError> {
 	let server = Arc::new(Server {
 		tools,
 		profile_dir: options.profile_dir,
-		client: zotero::Client::new(options.client_id),
+		client: zotero::Client::new(),
 		call_timeout,
 		launching: Mutex::new(()),
 	});

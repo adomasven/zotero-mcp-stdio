@@ -23,12 +23,11 @@ pub enum Error {
 
 pub struct Client {
 	http: reqwest::Client,
-	client_id: Option<String>,
 	next_id: AtomicU64,
 }
 
 impl Client {
-	pub fn new(client_id: Option<String>) -> Self {
+	pub fn new() -> Self {
 		let http = reqwest::Client::builder()
 			// Never route 127.0.0.1 through an HTTP_PROXY from the environment
 			.no_proxy()
@@ -40,7 +39,6 @@ impl Client {
 			.expect("HTTP client configuration is valid");
 		Client {
 			http,
-			client_id,
 			next_id: AtomicU64::new(1),
 		}
 	}
@@ -86,9 +84,6 @@ impl Client {
 		if let Some(name) = name {
 			request = request.header("Mcp-Name", name);
 		}
-		if let Some(client_id) = &self.client_id {
-			request = request.header("Zotero-MCP-Client", client_id);
-		}
 
 		let response = request.send().await.map_err(classify)?;
 		let status = response.status();
@@ -97,19 +92,6 @@ impl Client {
 		}
 		let bytes = response.bytes().await.map_err(classify)?;
 		parse_body(status, id, &bytes)
-	}
-}
-
-/// A valid `--client` value: what Zotero shows and keys permissions on, so
-/// it's checked once instead of being altered to fit in a header.
-pub fn parse_client_id(value: &str) -> Result<String, String> {
-	let valid = !value.is_empty()
-		&& value.len() <= 64
-		&& value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
-	if valid {
-		Ok(value.to_owned())
-	} else {
-		Err("use 1-64 letters, digits, '.', '_' or '-'".into())
 	}
 }
 
@@ -183,14 +165,6 @@ mod tests {
 				matches!(parse(status, body), Err(Error::Other(_))),
 				"{status} {body} was accepted"
 			);
-		}
-	}
-
-	#[test]
-	fn client_ids_are_checked_not_rewritten() {
-		assert_eq!(parse_client_id("claude-desktop").unwrap(), "claude-desktop");
-		for bad in ["", "codex\r\nX-Evil: 1", "kódex", "has space", &"a".repeat(65)] {
-			assert!(parse_client_id(bad).is_err(), "{bad:?} was accepted");
 		}
 	}
 }

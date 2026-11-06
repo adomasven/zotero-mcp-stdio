@@ -58,10 +58,7 @@ impl Fixture {
 
 	fn command_without_profile(&self) -> Command {
 		let mut command = Command::new(env!("CARGO_BIN_EXE_zotero-mcp-stdio"));
-		command
-			.args(["--client", "test-client"])
-			.arg("--tools")
-			.arg(self.path().join("tools.json"));
+		command.arg("--tools").arg(self.path().join("tools.json"));
 		command
 	}
 
@@ -160,8 +157,8 @@ impl Session {
 			"initialize",
 			json!({
 				"protocolVersion": "2025-11-25",
-				"capabilities": {},
-				"clientInfo": { "name": "test", "version": "0" }
+				"capabilities": { "elicitation": {} },
+				"clientInfo": { "name": "legacy-app", "version": "0" }
 			}),
 		);
 		assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
@@ -362,7 +359,6 @@ fn forwards_the_call_with_its_metadata_unchanged() {
 	assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"), "{head}");
 	// Zotero rejects any other Host, to block DNS rebinding
 	assert!(head.contains(&format!("host: 127.0.0.1:{}\r\n", zotero.port)), "{head}");
-	assert!(head.contains("zotero-mcp-client: test-client\r\n"), "{head}");
 	assert!(head.contains("mcp-name: zotero_search_items\r\n"), "{head}");
 	assert!(!head.contains("origin:"), "browser guard would drop the request");
 
@@ -375,7 +371,7 @@ fn forwards_the_call_with_its_metadata_unchanged() {
 }
 
 #[test]
-fn sends_legacy_calls_as_2026_requests_from_this_server() {
+fn sends_legacy_calls_as_2026_requests_naming_the_app() {
 	let fixture = Fixture::new();
 	let zotero = FakeZotero::replying(search_reply());
 	fixture.write_sidecar(json!({ "version": 1, "port": zotero.port }));
@@ -387,7 +383,8 @@ fn sends_legacy_calls_as_2026_requests_from_this_server() {
 
 	let meta = &zotero.requests()[0].1["params"]["_meta"];
 	assert_eq!(meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
-	assert_eq!(meta["io.modelcontextprotocol/clientInfo"]["name"], "zotero-mcp-stdio");
+	// The name the app gave in initialize, which Zotero keys permissions on
+	assert_eq!(meta["io.modelcontextprotocol/clientInfo"]["name"], "legacy-app");
 	// No capabilities, so Zotero won't ask for input a legacy client can't give
 	assert_eq!(meta["io.modelcontextprotocol/clientCapabilities"], json!({}));
 }
